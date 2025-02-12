@@ -12,3 +12,8 @@ docs/
 
 # Dotenv file
 .env
+
+dependencies
+
+!remappings.txt
+*.txt
