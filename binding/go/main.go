@@ -43,6 +43,16 @@ func init() {
 				&address,
 			},
 		},
+		{
+			Name:   "hash",
+			Usage:  "Run hash",
+			Action: hash,
+			Flags: []cli.Flag{
+				&rpcURL,
+				&privateKey,
+				&address,
+			},
+		},
 	}
 	app.Flags = []cli.Flag{}
 }
@@ -143,6 +153,72 @@ func run(ctx *cli.Context) error {
 	callOpts := &bind.CallOpts{Context: ctx.Context}
 	for {
 		tx, err := PrevRandao.Reset(auth)
+		if err != nil {
+			fmt.Println("send transaction err", err)
+		} else {
+			auth.Nonce.Add(auth.Nonce, common.Big1)
+		}
+		if tx != nil {
+			go func(tx *types.Transaction) {
+				receipt, err := bind.WaitMined(ctx.Context, client, tx)
+				if err != nil {
+					fmt.Println("wait receipt err", err)
+				}
+				if receipt.Status != types.ReceiptStatusSuccessful {
+					fmt.Println("tx reverted", receipt.TxHash)
+					return
+				}
+				value, err := PrevRandao.Value(callOpts)
+				if err != nil {
+					fmt.Println("call value err", err)
+				}
+				number, err := PrevRandao.Blocknumber(callOpts)
+				if err != nil {
+					fmt.Println("call blockNumber", err)
+				}
+				fmt.Printf("receipt.BlockNumber: %d\tcall.BlockNumber: %d\tvalue: %d\n", receipt.BlockNumber, number, value)
+			}(tx)
+		}
+		time.Sleep(1e9)
+	}
+}
+
+func hash(ctx *cli.Context) error {
+	rpcurl := ctx.String(rpcURL.Name)
+	client, err := ethclient.DialContext(ctx.Context, rpcurl)
+	if err != nil {
+		return err
+	}
+	chainID, err := client.ChainID(ctx.Context)
+	if err != nil {
+		return err
+	}
+	fmt.Println("chainID: ", chainID)
+
+	pk, err := crypto.HexToECDSA(strings.TrimPrefix(ctx.String(privateKey.Name), "0x"))
+	if err != nil {
+		return err
+	}
+	auth, err := bind.NewKeyedTransactorWithChainID(pk, chainID)
+	if err != nil {
+		return err
+	}
+	auth.GasLimit = 1e7
+	nonce, err := client.NonceAt(context.Background(), auth.From, nil)
+	if err != nil {
+		return err
+	}
+	auth.Nonce = new(big.Int).SetUint64(nonce)
+
+	prevrandao := common.HexToAddress(ctx.String(address.Name))
+	PrevRandao, err := binding.NewPrevRandao(prevrandao, client)
+	if err != nil {
+		return err
+	}
+
+	callOpts := &bind.CallOpts{Context: ctx.Context}
+	for {
+		tx, err := PrevRandao.Hash(auth)
 		if err != nil {
 			fmt.Println("send transaction err", err)
 		} else {
