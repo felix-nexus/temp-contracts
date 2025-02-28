@@ -7,144 +7,168 @@ import (
 	"os"
 	"strings"
 	binding "temp-contracts/src"
+	"time"
 
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
-	"github.com/pkg/errors"
+	"github.com/urfave/cli/v2"
+)
+
+var (
+	app *cli.App
+)
+
+func init() {
+	app = cli.NewApp()
+	app.Commands = []*cli.Command{
+		{
+			Name:   "deploy",
+			Usage:  "deploy PrevRandao Contract",
+			Action: deploy,
+			Flags: []cli.Flag{
+				&rpcURL,
+				&privateKey,
+			},
+		},
+		{
+			Name:   "reset",
+			Usage:  "Run reset",
+			Action: run,
+			Flags: []cli.Flag{
+				&rpcURL,
+				&privateKey,
+				&address,
+			},
+		},
+	}
+	app.Flags = []cli.Flag{}
+}
+
+var (
+	rpcURL = cli.StringFlag{
+		Name:     "rpc-url",
+		Required: true,
+	}
+	privateKey = cli.StringFlag{
+		Name:     "private-key",
+		Required: true,
+	}
+	address = cli.StringFlag{
+		Name:     "address",
+		Required: true,
+	}
 )
 
 func main() {
-	err := tstore()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "err: %v", err)
+	if err := app.Run(os.Args); err != nil {
+		_, _ = fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
 	}
 }
 
-func env() (*bind.TransactOpts, *ethclient.Client, error) {
-	privateKey := os.Getenv("PRIVATE_KEY")
-	rpc_url := os.Getenv("RPC_URL")
+func deploy(ctx *cli.Context) error {
+	rpcurl := ctx.String(rpcURL.Name)
+	client, err := ethclient.DialContext(ctx.Context, rpcurl)
+	if err != nil {
+		return err
+	}
+	chainID, err := client.ChainID(ctx.Context)
+	if err != nil {
+		return err
+	}
+	fmt.Println("chainID: ", chainID)
 
-	client, err := ethclient.Dial(rpc_url)
+	pk, err := crypto.HexToECDSA(strings.TrimPrefix(ctx.String(privateKey.Name), "0x"))
 	if err != nil {
-		return nil, nil, err
+		return err
 	}
+	auth, err := bind.NewKeyedTransactorWithChainID(pk, chainID)
+	if err != nil {
+		return err
+	}
+	auth.GasLimit = 1e7
 
-	key, err := crypto.HexToECDSA(privateKey)
-	if err != nil {
-		return nil, nil, err
-	}
-	chainId, err := client.ChainID(context.TODO())
-	if err != nil {
-		return nil, nil, err
-	}
-	auth, err := bind.NewKeyedTransactorWithChainID(key, chainId)
-	return auth, client, err
-}
-
-func tstore() error {
-	auth, backend, err := env()
+	address, tx, _, err := binding.DeployPrevRandao(auth, client)
 	if err != nil {
 		return err
 	}
-	op, tx1, OP, err := binding.DeployCancunOp(auth, backend)
+	receipt, err := bind.WaitMined(ctx.Context, client, tx)
 	if err != nil {
 		return err
 	}
-	caller, tx2, CALLER, err := binding.DeployCancunOpTCaller(auth, backend, op)
-	if err != nil {
-		return err
+	if receipt.Status != types.ReceiptStatusSuccessful {
+		return fmt.Errorf("transaction failed")
 	}
-
-	ctx := context.Background()
-	if receipt, err := bind.WaitMined(ctx, backend, tx1); err != nil {
-		return err
-	} else if receipt.Status != types.ReceiptStatusSuccessful {
-		return errors.New("revert")
-	}
-	if receipt, err := bind.WaitMined(ctx, backend, tx2); err != nil {
-		return err
-	} else if receipt.Status != types.ReceiptStatusSuccessful {
-		return errors.New("revert")
-	}
-
-	fmt.Println("\n", strings.Repeat("-", 80))
-	bytes, err := backend.CodeAt(ctx, op, nil)
-	if err != nil {
-		return err
-	}
-	fmt.Println("OP", op.Hex(), "size", len(bytes))
-	bytes, err = backend.CodeAt(ctx, caller, nil)
-	if err != nil {
-		return err
-	}
-	fmt.Println("CALLER", caller.Hex(), "size", len(bytes))
-
-	fmt.Println("\n", strings.Repeat("-", 80))
-	callOpts := &bind.CallOpts{Context: ctx}
-	value, err := OP.Value(callOpts)
-	if err != nil {
-		return err
-	}
-	fmt.Println("before", value)
-
-	setValue := big.NewInt(32)
-	tx, err := OP.SetValue(auth, setValue)
-	if err != nil {
-		return err
-	}
-
-	if receipt, err := bind.WaitMined(ctx, backend, tx); err != nil {
-		return errors.Wrap(err, "SetValue")
-	} else if receipt.Status != types.ReceiptStatusSuccessful {
-		return errors.New("revert SetValue")
-	} else {
-		event, err := OP.ParseSetValue(*receipt.Logs[0])
-		if err != nil {
-			return err
-		} else {
-			if setValue.Cmp(event.Value) != 0 {
-				fmt.Println("emit SetValue", event.Value, "value", setValue)
-			}
-		}
-	}
-
-	value, err = OP.Value(callOpts)
-	if err != nil {
-		return err
-	}
-	fmt.Println("after", value)
-	fmt.Println("\n", strings.Repeat("-", 80))
-	value, err = CALLER.Value(callOpts)
-	if err != nil {
-		return err
-	}
-	fmt.Println("before", value)
-	setValue = big.NewInt(64)
-	tx, err = OP.Execute(auth, caller, setValue)
-	if err != nil {
-		return err
-	}
-	if receipt, err := bind.WaitMined(ctx, backend, tx); err != nil {
-		return errors.Wrap(err, "Execute")
-	} else if receipt.Status != types.ReceiptStatusSuccessful {
-		return errors.New("revert Execute")
-	} else {
-		event, err := OP.ParseSetValue(*receipt.Logs[0])
-		if err != nil {
-			return err
-		} else {
-			if setValue.Cmp(event.Value) != 0 {
-				fmt.Println("emit SetValue", event.Value, "value", setValue)
-			}
-		}
-	}
-	value, err = CALLER.Value(callOpts)
-	if err != nil {
-		return err
-	}
-	fmt.Println("after", value)
+	fmt.Println("PrevRandao Address: ", address.Hex())
 
 	return nil
+}
+
+func run(ctx *cli.Context) error {
+	rpcurl := ctx.String(rpcURL.Name)
+	client, err := ethclient.DialContext(ctx.Context, rpcurl)
+	if err != nil {
+		return err
+	}
+	chainID, err := client.ChainID(ctx.Context)
+	if err != nil {
+		return err
+	}
+	fmt.Println("chainID: ", chainID)
+
+	pk, err := crypto.HexToECDSA(strings.TrimPrefix(ctx.String(privateKey.Name), "0x"))
+	if err != nil {
+		return err
+	}
+	auth, err := bind.NewKeyedTransactorWithChainID(pk, chainID)
+	if err != nil {
+		return err
+	}
+	auth.GasLimit = 1e7
+	nonce, err := client.NonceAt(context.Background(), auth.From, nil)
+	if err != nil {
+		return err
+	}
+	auth.Nonce = new(big.Int).SetUint64(nonce)
+
+	prevrandao := common.HexToAddress(ctx.String(address.Name))
+	PrevRandao, err := binding.NewPrevRandao(prevrandao, client)
+	if err != nil {
+		return err
+	}
+
+	callOpts := &bind.CallOpts{Context: ctx.Context}
+	for {
+		tx, err := PrevRandao.Reset(auth)
+		if err != nil {
+			fmt.Println("send transaction err", err)
+		} else {
+			auth.Nonce.Add(auth.Nonce, common.Big1)
+		}
+		if tx != nil {
+			go func(tx *types.Transaction) {
+				receipt, err := bind.WaitMined(ctx.Context, client, tx)
+				if err != nil {
+					fmt.Println("wait receipt err", err)
+				}
+				if receipt.Status != types.ReceiptStatusSuccessful {
+					fmt.Println("tx reverted", receipt.TxHash)
+					return
+				}
+				value, err := PrevRandao.Value(callOpts)
+				if err != nil {
+					fmt.Println("call value err", err)
+				}
+				number, err := PrevRandao.Blocknumber(callOpts)
+				if err != nil {
+					fmt.Println("call blockNumber", err)
+				}
+				fmt.Printf("receipt.BlockNumber: %d\tcall.BlockNumber: %d\tvalue: %d\n", receipt.BlockNumber, number, value)
+			}(tx)
+		}
+		time.Sleep(1e9)
+	}
 }
